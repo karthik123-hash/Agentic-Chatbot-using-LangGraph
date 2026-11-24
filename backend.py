@@ -43,6 +43,14 @@ llm = ChatGoogleGenerativeAI(
     max_retries=3,    # was 1: allow recovery from transient slowness
 )
 
+# Fallback model (used if the main model fails)
+fallback_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0.7,
+    timeout=120,
+    max_retries=3,
+)
+
 # Embeddings model
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
@@ -334,6 +342,7 @@ tools = [search_tool, calculator, get_stock_price, get_current_weather, rag_tool
 
 # Make the LLM tool-aware
 llm_with_tools = llm.bind_tools(tools)
+fallback_with_tools = fallback_llm.bind_tools(tools)
 
 
 # State
@@ -376,13 +385,17 @@ def chat_node(state: ChatState):
     try:
         response = llm_with_tools.invoke(messages)
     except Exception as e:
-        # Show a friendly message instead of crashing the app with a traceback
-        response = AIMessage(
-            content=(
-                f"Sorry, the model took too long or failed to respond "
-                f"({type(e).__name__}). Please try again."
+        print(f"Primary model failed: {type(e).__name__}: {e}", flush=True)
+        try:
+            response = fallback_with_tools.invoke(messages)
+        except Exception as e2:
+            print(f"Fallback model failed: {type(e2).__name__}: {e2}", flush=True)
+            response = AIMessage(
+                content=(
+                    f"Sorry, the model failed to respond "
+                    f"({type(e2).__name__}). Please try again."
+                )
             )
-        )
 
     return {"messages": [response]}
 
