@@ -1,6 +1,6 @@
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -15,7 +15,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-import os 
+import os
 from typing import Any
 from langgraph.types import interrupt, Command
 
@@ -23,46 +23,52 @@ from langgraph.types import interrupt, Command
 load_dotenv()
 
 
-# LLM 
+# ---------------------------------------------------------------------------
+# Persistent data location
+# In Docker, mount a host folder here so data survives redeploys:
+#   -v /home/ubuntu/chatbot-data:/app/data
+# ---------------------------------------------------------------------------
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "faiss_db")
+CHECKPOINT_DB = os.path.join(DATA_DIR, "chatbot.db")
+
+
+# LLM
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.5-flash",
     temperature=0.7,
-    timeout=30,
-    max_retries=1,
+    timeout=120,      # was 30: too short for slow / tool-heavy requests
+    max_retries=3,    # was 1: allow recovery from transient slowness
 )
 
 # Embeddings model
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
 
-
 def ingest_rag_document(file_path):
-    DB_PATH = "faiss_db"
     loader = PyPDFLoader(file_path)
     docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     vector_store = FAISS.from_documents(chunks, embeddings)
     vector_store.save_local(DB_PATH)
-    
 
 
 def get_retriever():
-    DB_PATH = "faiss_db"
     vector_store = FAISS.load_local(
-            folder_path=DB_PATH,
-            embeddings=embeddings,
-            allow_dangerous_deserialization=True
-        )
-    
+        folder_path=DB_PATH,
+        embeddings=embeddings,
+        allow_dangerous_deserialization=True,
+    )
+
     retriever = vector_store.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 4}
+        search_kwargs={"k": 4},
     )
 
     return retriever
-
-
 
 
 # rag tool
@@ -78,7 +84,11 @@ def rag_tool(query: str) -> str:
     Args:
         query: The question or search query used to retrieve PDF content.
     """
-    retriever = get_retriever()
+    try:
+        retriever = get_retriever()
+    except Exception:
+        return "No PDF has been uploaded yet. Please upload a PDF first."
+
     documents = retriever.invoke(query)
 
     if not documents:
@@ -100,14 +110,13 @@ def rag_tool(query: str) -> str:
     return "\n\n".join(formatted_documents)
 
 
-
-
 # Tools
 
+# Smaller / faster search results -> faster second LLM call
 search_tool = TavilySearch(
-    max_results=5,
+    max_results=3,
     topic="general",
-    search_depth="advanced"
+    search_depth="basic",
 )
 
 
@@ -126,7 +135,7 @@ def calculator(expression: str) -> str:
             "round": round,
             "min": min,
             "max": max,
-            "sum": sum
+            "sum": sum,
         }
 
         result = eval(expression, {"__builtins__": {}}, allowed)
@@ -136,18 +145,38 @@ def calculator(expression: str) -> str:
         return f"Calculation error: {str(e)}"
 
 
-
-
 @tool
 def get_stock_price(symbol: str) -> dict:
     """
-    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
-    using Alpha Vantage with API key in the URL.
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
+    using Alpha Vantage.
     """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=9MZO2JUBR7IFNTOI"
-    r = requests.get(url)
-    return r.json()
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
 
+    if not api_key:
+        return {
+            "error": "Alpha Vantage API key is missing. "
+                     "Set the ALPHAVANTAGE_API_KEY environment variable."
+        }
+
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "GLOBAL_QUOTE",
+                "symbol": symbol,
+                "apikey": api_key,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    except requests.Timeout:
+        return {"error": "The stock price service timed out. Please try again."}
+
+    except requests.RequestException as error:
+        return {"error": f"Could not fetch stock price: {error}"}
 
 
 @tool
@@ -169,7 +198,7 @@ def purchase_stock(symbol: str, quantity: int) -> dict:
             "symbol": symbol,
             "quantity": quantity,
         }
-    
+
     else:
         return {
             "status": "cancelled",
@@ -177,8 +206,6 @@ def purchase_stock(symbol: str, quantity: int) -> dict:
             "symbol": symbol,
             "quantity": quantity,
         }
-
-
 
 
 @tool
@@ -288,7 +315,7 @@ def get_current_weather(location: str) -> str:
         return "The weather service request timed out. Please try again."
 
     except requests.HTTPError as error:
-        status_code = error.response.status_code if error.response else "unknown"
+        status_code = error.response.status_code if error.response is not None else "unknown"
 
         if status_code == 401:
             return "The OpenWeather API key is invalid or inactive."
@@ -300,23 +327,19 @@ def get_current_weather(location: str) -> str:
 
     except (KeyError, TypeError, ValueError) as error:
         return f"Unexpected weather API response: {error}"
-    
 
 
 # Make tool list
-tools = [search_tool,calculator, get_stock_price,get_current_weather, rag_tool, purchase_stock]
+tools = [search_tool, calculator, get_stock_price, get_current_weather, rag_tool, purchase_stock]
 
 # Make the LLM tool-aware
 llm_with_tools = llm.bind_tools(tools)
-
-
 
 
 # State
 class ChatState(TypedDict):
 
     messages: Annotated[list[BaseMessage], add_messages]
-
 
 
 # Nodes 1
@@ -347,25 +370,30 @@ def chat_node(state: ChatState):
 
     messages = [
         system_message,
-        *state["messages"]
+        *state["messages"],
     ]
 
-    response = llm_with_tools.invoke(messages)
+    try:
+        response = llm_with_tools.invoke(messages)
+    except Exception as e:
+        # Show a friendly message instead of crashing the app with a traceback
+        response = AIMessage(
+            content=(
+                f"Sorry, the model took too long or failed to respond "
+                f"({type(e).__name__}). Please try again."
+            )
+        )
 
     return {"messages": [response]}
-
-
 
 
 # Nodes 2 - tool node
 tool_node = ToolNode(tools)
 
 
-
 # Checkpointer
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
+conn = sqlite3.connect(database=CHECKPOINT_DB, check_same_thread=False)
 checkpoint = SqliteSaver(conn)
-
 
 
 # graph
@@ -375,13 +403,12 @@ graph = StateGraph(ChatState)
 graph.add_node('chat_node', chat_node)
 graph.add_node('tools', tool_node)
 
-#add edges
+# add edges
 graph.add_edge(START, 'chat_node')
-graph.add_conditional_edges("chat_node",tools_condition)
+graph.add_conditional_edges("chat_node", tools_condition)
 graph.add_edge('tools', 'chat_node')
 
 chatbot = graph.compile(checkpointer=checkpoint)
-
 
 
 # Helper functions for Streamlit frontend
@@ -391,5 +418,3 @@ def get_all_threads():
         all_threads.add(ckpt.config['configurable']['thread_id'])
 
     return list(all_threads)
-
-
