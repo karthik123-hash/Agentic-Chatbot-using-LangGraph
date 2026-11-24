@@ -19,6 +19,29 @@ import tempfile
 import os
 
 
+# Convert a model reply into plain text.
+# Newer Gemini models return content as a list of blocks such as
+# [{"type": "text", "text": "..."}, {"type": "text", "extras": {...}}]
+# instead of a simple string.
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+
+        return "".join(parts)
+
+    return ""
+
+
 # Generate a unique thread ID for each new conversation
 def generate_thread_id():
     return str(uuid.uuid4())
@@ -248,8 +271,10 @@ def resume_hitl_execution(decision):
                         AIMessage
                     ):
 
-                        if message_chunk.content:
-                            yield message_chunk.content
+                        text = extract_text(message_chunk.content)
+
+                        if text:
+                            yield text
 
             # Display the streamed final answer
             resumed_ai_message = st.write_stream(
@@ -406,7 +431,7 @@ for thread_id in st.session_state["chat_threads"][::-1]:
             # Convert the LangChain message into a dictionary
             temp_messages.append({
                 "role": role,
-                "content": message.content
+                "content": extract_text(message.content)
             })
 
         # Replace the current UI history with the selected conversation
@@ -650,7 +675,10 @@ if user_input:
                     message_chunk,
                     AIMessage
                 ):
-                    yield message_chunk.content
+                    text = extract_text(message_chunk.content)
+
+                    if text:
+                        yield text
 
             # ========================= HITL ADDED =========================
 
