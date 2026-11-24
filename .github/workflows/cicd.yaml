@@ -96,7 +96,7 @@ jobs:
   continuous_deployment:
     name: Deploy to AWS EC2
     needs: push_to_registry
-    runs-on: ec2-chatbot-runner
+    runs-on: self-hosted
 
     steps:
       - name: Log in to Docker Hub
