@@ -548,7 +548,7 @@ if submission:
 
         uploaded_pdf = uploaded_files[0]
 
-        # Store the temporary file path
+        # Store the temporary file pathss
         temporary_file_path = None
 
         try:
